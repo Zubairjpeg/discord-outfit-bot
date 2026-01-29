@@ -219,6 +219,49 @@ client.on('messageCreate', async (message) => {
     saveStatus({ open: true });
     message.channel.send('🔓 Submissions are now OPEN.');
   }
+
+  // !countdown - manual command
+if (message.content.startsWith('!countdown') && message.author.id === ADMIN_ID) {
+  const now = new Date();
+  const subsOpen = now < submissionDeadline;
+  const voteOpen = now < votingDeadline;
+
+  const subDiff = Math.max(0, submissionDeadline - now);
+  const voteDiff = Math.max(0, votingDeadline - now);
+
+  const format = (ms) => {
+    const d = Math.floor(ms / (1000 * 60 * 60 * 24));
+    const h = Math.floor((ms / (1000 * 60 * 60)) % 24);
+    const m = Math.floor((ms / (1000 * 60)) % 60);
+    return `${d}d ${h}h ${m}m`;
+  };
+
+  const embed = new EmbedBuilder()
+    .setTitle('⏳ Outfit Contest Countdown')
+    .setColor(0x5865F2)
+    .addFields(
+      {
+        name: '📥 Submissions',
+        value: subsOpen
+          ? `Closes in: **${format(subDiff)}**`
+          : '❌ Closed',
+      },
+      {
+        name: '🗳️ Voting',
+        value: voteOpen
+          ? `Closes in: **${format(voteDiff)}**`
+          : '❌ Closed',
+      },
+      {
+        name: 'Status',
+        value: `${subsOpen ? '✅ Submissions Open' : '🔒 Submissions Closed'}\n${voteOpen ? '✅ Voting Open' : '🔒 Voting Closed'}`,
+      }
+    )
+    .setFooter({ text: 'Manually requested' });
+
+  message.channel.send({ embeds: [embed] });
+}
+
 });
 
 // ========== COUNTDOWN LOGIC ==========
