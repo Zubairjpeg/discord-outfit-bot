@@ -1,7 +1,8 @@
 const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
-const { Pool } = require('pg');
+const fs = require('fs');
 require('dotenv').config();
 
+const SUBMISSIONS_FILE = './submissions.json';
 const STATUS_FILE = './status.json';
 
 const submissionChannelId = process.env.SUBMISSION_CHANNEL_ID;
@@ -11,12 +12,6 @@ const countdownChannelId = process.env.COUNTDOWN_CHANNEL_ID;
 const ADMIN_ID = '103524746192248832';
 const VOTE_EMOJI = 'bappotech';
 const VOTE_EMOJI_ID = '1256552383631331449';
-
-// === PostgreSQL Setup ===
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
 
 // === Submission/Voting Deadlines ===
 const launchDate = new Date(); // starts now
@@ -34,42 +29,341 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.Reaction]
 });
 
-// === PostgreSQL Functions ===
-async function loadSubmissions() {
-  const result = await pool.query('SELECT * FROM submissions');
-  return result.rows;
+function loadSubmissions() {
+  if (!fs.existsSync(SUBMISSIONS_FILE)) fs.writeFileSync(SUBMISSIONS_FILE, '[]');
+  return JSON.parse(fs.readFileSync(SUBMISSIONS_FILE));
 }
 
-async function saveSubmission(userId, outfitData) {
-  await pool.query(
-    'INSERT INTO submissions (user_id, outfit_data) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET outfit_data = $2',
-    [userId, outfitData]
-  );
+function saveSubmissions(data) {
+  fs.writeFileSync(SUBMISSIONS_FILE, JSON.stringify(data, null, 2));
 }
 
-// === Bot Event Handlers ===
+function loadStatus() {
+  if (!fs.existsSync(STATUS_FILE)) fs.writeFileSync(STATUS_FILE, JSON.stringify({ open: true }, null, 2));
+  return JSON.parse(fs.readFileSync(STATUS_FILE));
+}
+
+function saveStatus(data) {
+  fs.writeFileSync(STATUS_FILE, JSON.stringify(data, null, 2));
+}
+
 client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  startCountdown();
 });
 
 client.on('messageCreate', async (message) => {
   if (message.channel.type !== 1 || message.author.bot) return;
 
-  const now = new Date();
-  if (now > submissionDeadline) {
-    return message.reply('❌ Submissions are closed.');
+  const status = loadStatus();
+  if (!status.open || new Date() > submissionDeadline) {
+    return message.reply('❌ Submissions are currently closed.');
   }
 
-  const outfitData = {
-    userId: message.author.id,
-    content: message.content,
-    attachments: message.attachments.map(a => a.url),
-    timestamp: new Date().toISOString()
-  };
+  const imgurRegex = /(https?:\/\/)?(www\.)?(i\.)?imgur\.com\/[a-zA-Z0-9]+(\.jpg|\.png|\.gif|\.jpeg)?/;
+  let imageUrl = null;
 
-  await saveSubmission(message.author.id, outfitData);
-  message.reply('✅ Submission received!');
+  const matches = message.content.match(imgurRegex);
+  if (matches) {
+    imageUrl = matches[0];
+    if (!imageUrl.match(/\.(jpeg|jpg|png|gif)$/)) {
+      imageUrl += '.jpeg';
+    }
+  }
+
+  if (!imageUrl && message.attachments.size > 0) {
+    const img = message.attachments.find(a => a.contentType?.startsWith('image'));
+    if (img) imageUrl = img.url;
+  }
+
+  if (!imageUrl) return message.reply('❌ Please send a valid image.');
+
+  const submissions = loadSubmissions();
+  const submissionChannel = await client.channels.fetch(submissionChannelId);
+
+  let existing = submissions.find(s => s.userId === message.author.id);
+
+  if (existing) {
+    try {
+      const msg = await submissionChannel.messages.fetch(existing.messageId);
+      const updatedEmbed = EmbedBuilder.from(msg.embeds[0]).setImage(imageUrl);
+      await msg.edit({ embeds: [updatedEmbed] });
+
+      existing.imageUrl = imageUrl;
+      saveSubmissions(submissions);
+
+      await message.reply('🔁 Submission updated!');
+      const confirmationChannel = await client.channels.fetch(confirmationChannelId);
+      await confirmationChannel.send(`🔁 <@${message.author.id}> updated #${existing.id}\n${imageUrl}`);
+      return;
+    } catch (err) {
+      console.error('Update failed:', err);
+      return message.reply('❌ Failed to update.');
+    }
+  }
+
+  const submissionId = submissions.length + 1;
+  const embed = new EmbedBuilder()
+    .setTitle(`📸 Submission #${submissionId}`)
+    .setImage(imageUrl)
+    .setColor(0x2f3136)
+    .setFooter({ text: 'Vote with :bappotech:' });
+
+  const sent = await submissionChannel.send({ embeds: [embed] });
+  await sent.react(`<:${VOTE_EMOJI}:${VOTE_EMOJI_ID}>`);
+
+  submissions.push({
+    id: submissionId,
+    userId: message.author.id,
+    imageUrl,
+    messageId: sent.id,
+    votes: 0
+  });
+
+  saveSubmissions(submissions);
+  await message.reply('✅ Submission received!');
+
+  try {
+    const confirmationChannel = await client.channels.fetch(confirmationChannelId);
+    await confirmationChannel.send(`✅ <@${message.author.id}> submitted #${submissionId}\n${imageUrl}`);
+  } catch (err) {
+    console.error('Confirmation error:', err);
+  }
 });
 
-// === Login Bot ===
-client.login(process.env.TOKEN);
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.partial) await reaction.fetch();
+  if (reaction.message.partial) await reaction.message.fetch();
+  if (reaction.message.channel.id !== submissionChannelId) return;
+
+  if (reaction.emoji.id !== VOTE_EMOJI_ID) {
+    try {
+      await reaction.users.remove(user.id);
+    } catch (err) {
+      console.error('Failed to remove reaction:', err);
+    }
+  }
+});
+// ========== BOT COMMANDS ==========
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  const submissions = loadSubmissions();
+
+  // !tally
+  if (message.content.startsWith('!tally')) {
+    const updated = [];
+
+    for (const sub of submissions) {
+      try {
+        const msg = await client.channels.fetch(submissionChannelId)
+          .then(ch => ch.messages.fetch(sub.messageId));
+
+        const reaction = msg.reactions.cache.find(r => r.emoji.id === VOTE_EMOJI_ID);
+        const count = reaction ? reaction.count - 1 : 0;
+
+        sub.votes = count;
+        updated.push(sub);
+      } catch (err) {
+        console.error('Tally error:', err.message);
+      }
+    }
+
+    saveSubmissions(updated);
+
+    const sorted = [...updated].sort((a, b) => b.votes - a.votes);
+    const results = sorted.map(s => `#${s.id}: ${s.votes} vote(s)`).join('\n');
+    message.channel.send(`📊 **Vote Results:**\n${results}`);
+  }
+
+  // !winner
+  if (message.content.startsWith('!winner')) {
+    if (message.author.id !== ADMIN_ID) return message.reply('❌ Not authorized.');
+    const sorted = [...submissions].sort((a, b) => b.votes - a.votes);
+    const count = parseInt(message.content.split(' ')[1]) || 1;
+    const winners = sorted.slice(0, count);
+    const result = winners.map(w => `🥇 #${w.id} — ${w.votes} votes`).join('\n');
+
+    message.channel.send(`🏆 **Winner${count > 1 ? 's' : ''}:**\n${result}`);
+
+    const confirm = await client.channels.fetch(confirmationChannelId);
+    for (const w of winners) {
+      await confirm.send(`🎉 Winner: <@${w.userId}> with Submission #${w.id} (${w.votes} votes)`);
+    }
+  }
+
+  // !votes
+  if (message.content.startsWith('!votes')) {
+    const id = parseInt(message.content.split(' ')[1]);
+    const sub = submissions.find(s => s.id === id);
+    if (!sub) return message.channel.send(`❌ No submission with ID #${id}`);
+    message.channel.send(`📊 Submission #${id} has **${sub.votes}** vote(s).`);
+  }
+
+  // !reset
+  if (message.content.startsWith('!reset') && message.author.id === ADMIN_ID) {
+    saveSubmissions([]);
+    message.channel.send('🧹 Submissions cleared.');
+  }
+
+  // !close
+  if (message.content.startsWith('!close') && message.author.id === ADMIN_ID) {
+    saveStatus({ open: false });
+    message.channel.send('🔒 Submissions are now CLOSED.');
+  }
+
+  // !open
+  if (message.content.startsWith('!open') && message.author.id === ADMIN_ID) {
+    saveStatus({ open: true });
+    message.channel.send('🔓 Submissions are now OPEN.');
+  }
+
+  // !countdown - manual command
+if (message.content.startsWith('!countdown') && message.author.id === ADMIN_ID) {
+  const now = new Date();
+  const subsOpen = now < submissionDeadline;
+  const voteOpen = now < votingDeadline;
+
+  const subDiff = Math.max(0, submissionDeadline - now);
+  const voteDiff = Math.max(0, votingDeadline - now);
+
+  const format = (ms) => {
+    const d = Math.floor(ms / (1000 * 60 * 60 * 24));
+    const h = Math.floor((ms / (1000 * 60 * 60)) % 24);
+    const m = Math.floor((ms / (1000 * 60)) % 60);
+    return `${d}d ${h}h ${m}m`;
+  };
+
+  const embed = new EmbedBuilder()
+    .setTitle('⏳ Outfit Contest Countdown')
+    .setColor(0x5865F2)
+    .addFields(
+      {
+        name: '📥 Submissions',
+        value: subsOpen
+          ? `Closes in: **${format(subDiff)}**`
+          : '❌ Closed',
+      },
+      {
+        name: '🗳️ Voting',
+        value: voteOpen
+          ? `Closes in: **${format(voteDiff)}**`
+          : '❌ Closed',
+      },
+      {
+        name: 'Status',
+        value: `${subsOpen ? '✅ Submissions Open' : '🔒 Submissions Closed'}\n${voteOpen ? '✅ Voting Open' : '🔒 Voting Closed'}`,
+      }
+    )
+    .setFooter({ text: 'Manually requested' });
+
+  message.channel.send({ embeds: [embed] });
+}
+
+});
+
+// ========== COUNTDOWN LOGIC ==========
+
+async function startCountdown() {
+  const channel = await client.channels.fetch(countdownChannelId);
+  const countdownMessage = await channel.send('⏳ Initializing contest countdown...');
+
+  const interval = setInterval(async () => {
+    const now = new Date();
+    const subsOpen = now < submissionDeadline;
+    const voteOpen = now < votingDeadline;
+
+    const subDiff = Math.max(0, submissionDeadline - now);
+    const voteDiff = Math.max(0, votingDeadline - now);
+
+    const format = (ms) => {
+      const d = Math.floor(ms / (1000 * 60 * 60 * 24));
+      const h = Math.floor((ms / (1000 * 60 * 60)) % 24);
+      const m = Math.floor((ms / (1000 * 60)) % 60);
+      return `${d}d ${h}h ${m}m`;
+    };
+
+    const embed = new EmbedBuilder()
+      .setTitle('⏳ Outfit Contest Countdown')
+      .setColor(0x5865F2)
+      .addFields(
+        {
+          name: '📥 Submissions',
+          value: subsOpen
+            ? `Closes in: **${format(subDiff)}**`
+            : '❌ Closed',
+        },
+        {
+          name: '🗳️ Voting',
+          value: voteOpen
+            ? `Closes in: **${format(voteDiff)}**`
+            : '❌ Closed',
+        },
+        {
+          name: 'Status',
+          value: `${subsOpen ? '✅ Submissions Open' : '🔒 Submissions Closed'}\n${voteOpen ? '✅ Voting Open' : '🔒 Voting Closed'}`,
+        }
+      )
+      .setFooter({ text: 'Updated every 10 minutes' });
+
+    try {
+      await countdownMessage.edit({ embeds: [embed] });
+    } catch (e) {
+      console.error('Countdown update failed:', e.message);
+    }
+
+    // Auto-close logic
+    const status = loadStatus();
+    if (!subsOpen && status.open) {
+      saveStatus({ open: false });
+      console.log('🔒 Auto-closed submissions (deadline reached)');
+    }
+
+    if (!subsOpen && !voteOpen) {
+      clearInterval(interval); // stop timer once both phases are closed
+      console.log('✅ Contest fully closed');
+    }
+  }, 10 * 60 * 1000); // every 10 minutes
+}
+
+client.commands = new Collection();
+client.commands.set('submissions', {
+  data: new SlashCommandBuilder()
+    .setName('submissions')
+    .setDescription('View all submissions (admin only)'),
+  async execute(interaction) {
+    if (interaction.user.id !== ADMIN_ID) return interaction.reply({ content: '❌ Not authorized.', ephemeral: true });
+
+    const subs = await getSubmissions();
+    if (!subs.length) return interaction.reply({ content: '📭 No submissions found.', ephemeral: true });
+
+    const page = 0;
+    const embed = new EmbedBuilder()
+      .setTitle(`📸 Submission #${subs[page].id}`)
+      .setDescription(`👤 <@${subs[page].user_id}>
+👍 ${subs[page].votes} vote(s)`)
+      .setImage(subs[page].image_url)
+      .setFooter({ text: `Page ${page + 1} of ${subs.length}` });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`del_${subs[page].id}`).setLabel('🗑 Delete').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`upvote_${subs[page].id}`).setLabel('👍 +1 Vote').setStyle(ButtonStyle.Primary)
+    );
+
+    await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+  }
+});
+
+client.on('interactionCreate', async interaction => {
+  if (interaction.isChatInputCommand()) {
+    const command = client.commands.get(interaction.commandName);
+    if (command) await command.execute(interaction);
+  }
+
+  if (interaction.isButton()) {
+    const [action, id] = interaction.customId.split('_');
+    if (interaction.user.id !== ADMIN_ID) return interaction.reply({ content: '❌ Unauthorized.', ephemeral: true });
+
+client.login(process.env.DISCORD_TOKEN);
