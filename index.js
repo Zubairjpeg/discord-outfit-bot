@@ -220,6 +220,24 @@ client.on('messageCreate', async (message) => {
     message.channel.send('🔓 Submissions are now OPEN.');
   }
 
+  
+  // !remove @user or !remove userID
+  if (message.content.startsWith('!remove') && message.author.id === ADMIN_ID) {
+    const args = message.content.split(' ');
+    const userId = args[1]?.replace(/[<@!>]/g, '');
+
+    if (!userId) return message.channel.send('❌ Usage: !remove <user mention or ID>');
+
+    const result = await pool.query('DELETE FROM submissions WHERE user_id = $1 RETURNING id', [userId]);
+
+    if (result.rowCount > 0) {
+      message.channel.send(`🗑 Removed submission from <@${userId}> (ID #${result.rows[0].id})`);
+    } else {
+      message.channel.send(`⚠️ No submission found for <@${userId}>`);
+    }
+  }
+
+
   // !countdown - manual command
 if (message.content.startsWith('!countdown') && message.author.id === ADMIN_ID) {
   const now = new Date();
@@ -328,42 +346,8 @@ async function startCountdown() {
   }, 10 * 60 * 1000); // every 10 minutes
 }
 
-client.commands = new Collection();
-client.commands.set('submissions', {
-  data: new SlashCommandBuilder()
-    .setName('submissions')
-    .setDescription('View all submissions (admin only)'),
-  async execute(interaction) {
-    if (interaction.user.id !== ADMIN_ID) return interaction.reply({ content: '❌ Not authorized.', ephemeral: true });
 
-    const subs = await getSubmissions();
-    if (!subs.length) return interaction.reply({ content: '📭 No submissions found.', ephemeral: true });
 
-    const page = 0;
-    const embed = new EmbedBuilder()
-      .setTitle(`📸 Submission #${subs[page].id}`)
-      .setDescription(`👤 <@${subs[page].user_id}>
-👍 ${subs[page].votes} vote(s)`)
-      .setImage(subs[page].image_url)
-      .setFooter({ text: `Page ${page + 1} of ${subs.length}` });
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`del_${subs[page].id}`).setLabel('🗑 Delete').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(`upvote_${subs[page].id}`).setLabel('👍 +1 Vote').setStyle(ButtonStyle.Primary)
-    );
-
-    await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-  }
-});
-
-client.on('interactionCreate', async interaction => {
-  if (interaction.isChatInputCommand()) {
-    const command = client.commands.get(interaction.commandName);
-    if (command) await command.execute(interaction);
-  }
-
-  if (interaction.isButton()) {
-    const [action, id] = interaction.customId.split('_');
-    if (interaction.user.id !== ADMIN_ID) return interaction.reply({ content: '❌ Unauthorized.', ephemeral: true });
 
 client.login(process.env.DISCORD_TOKEN);
